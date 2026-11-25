@@ -1,0 +1,19 @@
+{
+  "name": "depth-occlusion-lab",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "分层深度 (Hi-Z) 遮挡剔除器与光栅调试视窗",
+  "scripts": {
+    "start": "node serve.js",
+    "verify": "node cli.js verify",
+    "audit": "node cli.js audit",
+    "stale": "node cli.js stale",
+    "bench": "node cli.js bench",
+    "smoke": "node tools/dom-smoke.mjs",
+    "test": "node --test test/culler.test.js"
+  },
+  "devDependencies": {
+    "jsdom": "^31.0.1"
+  }
+}

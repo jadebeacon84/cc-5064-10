@@ -1,0 +1,128 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>深度遮挡实验室 · Hi-Z Occlusion Culler</title>
+<link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo-dot"></span>
+    <h1>深度遮挡实验室</h1>
+    <span class="sub">分层深度 Hi-Z · 保守包围查询 · 零误剔审计</span>
+  </div>
+  <nav id="scene-tabs" class="scene-tabs" aria-label="场景切换"></nav>
+  <div class="top-actions">
+    <label class="switch">
+      <input type="checkbox" id="chk-cull" checked />
+      <span>遮挡剔除</span>
+    </label>
+    <label class="switch">
+      <input type="checkbox" id="chk-rotate" />
+      <span>自动转动</span>
+    </label>
+    <button id="btn-freeze" class="btn warn">冻结 Hi-Z（陈旧证据实验）</button>
+    <label class="switch danger">
+      <input type="checkbox" id="chk-circular" />
+      <span>模拟候选写入深度（循环依据）</span>
+    </label>
+  </div>
+</header>
+
+<div id="anomaly-bar" class="anomaly hidden"></div>
+
+<main class="layout">
+  <section class="col-view">
+    <div class="panel viewport-panel">
+      <div class="panel-head">
+        <h2>光栅调试视窗 <span class="dim" id="view-res"></span></h2>
+        <div class="view-toggles">
+          <label><input type="checkbox" id="chk-overlay" checked /> 查询矩形/包围体</label>
+          <button id="btn-reset-cam" class="btn tiny">重置机位</button>
+        </div>
+      </div>
+      <div class="viewport-wrap" id="viewport-wrap">
+        <canvas id="view" width="480" height="270"></canvas>
+        <canvas id="overlay" width="480" height="270"></canvas>
+        <div class="hud" id="hud"></div>
+        <div class="cam-hint">左键拖动转动 · 滚轮缩放 · 右键/Shift 拖动平移目标</div>
+      </div>
+      <div class="stats-grid" id="stats-grid"></div>
+      <div class="motion-box" id="motion-box"></div>
+    </div>
+
+    <div class="panel compare-panel">
+      <div class="panel-head"><h2>开启 / 关闭剔除像素对比（同分辨率软件光栅）</h2></div>
+      <div class="compare-row">
+        <figure><figcaption>关闭剔除 · 全量真实绘制</figcaption><canvas id="cmp-off" width="480" height="270"></canvas></figure>
+        <figure><figcaption>开启剔除 · 实际绘制列表</figcaption><canvas id="cmp-on" width="480" height="270"></canvas></figure>
+        <figure><figcaption>像素差异（红=不同）</figcaption><canvas id="cmp-diff" width="480" height="270"></canvas></figure>
+      </div>
+      <div id="compare-stats" class="compare-stats"></div>
+    </div>
+  </section>
+
+  <aside class="col-side">
+    <div class="panel hiz-panel">
+      <div class="panel-head">
+        <h2>深度金字塔层</h2>
+        <select id="sel-hiz-mode">
+          <option value="linear">线性视深伪彩</option>
+          <option value="raw">原始深度 [0,1]</option>
+          <option value="mask">遮挡物来源掩码</option>
+        </select>
+      </div>
+      <div class="hiz-main-wrap">
+        <canvas id="hiz-main"></canvas>
+      </div>
+      <div class="hiz-levels" id="hiz-levels"></div>
+      <div class="hiz-legend" id="hiz-legend"></div>
+    </div>
+
+    <div class="panel candidates-panel">
+      <div class="panel-head"><h2>候选状态与层级查询证据</h2>
+        <span class="dim">点击行定位查询纹素</span>
+      </div>
+      <div class="table-scroll">
+        <table class="cand-table">
+          <thead><tr>
+            <th>候选</th><th>状态</th><th>参照像素</th><th>最近深度余量</th><th>层级/纹素</th><th>深度来源</th>
+          </tr></thead>
+          <tbody id="candidate-rows"></tbody>
+        </table>
+      </div>
+    </div>
+  </aside>
+
+  <section class="col-results panel">
+    <div class="panel-head">
+      <h2>实际可见集与审计结果</h2>
+      <div class="scan-actions">
+        <button id="btn-scan-scene" class="btn primary">对当前场景跑声明范围扫描</button>
+        <button id="btn-scan-all" class="btn">三场景完整校验（CLI 等价）</button>
+      </div>
+    </div>
+    <div class="sets-grid">
+      <div>
+        <h3>无剔除参照 · 实际可见 uid 集合 <span class="dim" id="visible-count"></span></h3>
+        <div id="visible-chips" class="chips"></div>
+      </div>
+      <div>
+        <h3>当前证据判 occluded / 实际排除 <span class="dim" id="culled-count"></span></h3>
+        <div id="culled-chips" class="chips"></div>
+      </div>
+    </div>
+    <pre id="scan-report" class="scan-report">尚未运行扫描。图形界面每帧都在用无剔除参照做实时零误剔核对；也可用上方按钮运行多机位声明范围校验。</pre>
+  </section>
+</main>
+
+<footer class="footer">
+  <span>决定只来自当前有效的 Hi-Z 深度证据；无视锥外过滤冒充遮挡，也不读取预置可见名单。</span>
+  <span>命令行辅助：<code>node cli.js verify</code> · <code>node cli.js audit</code> · <code>node cli.js stale</code></span>
+</footer>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
