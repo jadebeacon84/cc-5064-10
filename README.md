@@ -31,6 +31,8 @@ npm start                 # 等价于 node serve.js
 | 右侧 Hi-Z 面板 | 切换线性深度 / 原始深度 / 来源 bit 着色，选择查看层级 |
 | 候选表行 | 选中后在视口叠加包围线框与实际查询纹素热力格 |
 | 运动界限滑杆 + 安全策略 | 调整允许的像素运动阈值（默认 4 texel），切换陈旧证据处理策略 |
+| 运动面板证据行 | 显示当前深度层版本号、历史 occluded 缓存条数、本帧命中/适用范围失效计数 |
+| 候选表缓存裁决 | 每行标注 `cache-hit / version-stale / scope-grew / depth-nearer / not-cached` |
 | 底部扫描按钮 | 在页面内对当前场景或全部三场景跑真实 `verifyScene` 扫描 |
 
 界面各区域全部来自真实运算：
@@ -48,7 +50,8 @@ npm start                 # 等价于 node serve.js
 ## 2. 命令行（仅辅助）
 
 ```bash
-npm test                 # node:test 11 项：约定、扫描、fuzz、运动界限、安全策略
+npm test                 # node:test 20 项：约定、扫描、fuzz、运动界限、安全策略、
+                         #   近面/屏幕边缘边界回归、证据版本失效、相机跳变×迟到查询回放、A→B→A 往返
 npm run verify           # 全量验证：3 场景 × 292 机位 @480×270
 node cli.js verify --quick            # 快速：3 场景 × 148 机位 @320×180
 node cli.js verify --scene hole       # 只跑一个场景（wall|hole|complex）
@@ -56,6 +59,9 @@ npm run audit            # 遮挡物 bit 来源、每条剔除的证据链、合
 npm run stale            # 冻结金字塔 + 转镜头：复现旧深度漏显，并验证安全策略为零误剔
 npm run bench            # 60 帧流水线/全量渲染耗时与跳过三角形统计
 node cli.js list         # 列出场景
+npm run probe:boundary   # 最小复现探针：近面跨越/屏幕边缘/相机跳变/近面临域
+npm run probe:sweep      # 216 帧激进边界穷举（含遮挡物自身跨近面、状态迁移）
+npm run probe:stale      # 非严重 requery 区间沿用旧 occluded 的漏绘排查
 npm run smoke            # jsdom UI 接线冒烟（需 devDependency：npm install）
 ```
 
@@ -133,6 +139,23 @@ d(z) = far/(far-near) · (1 - near/z) ∈ [0,1]，越小越近
 `stale-blocked`（仍然提交绘制）；`apply-for-experiment` 仅供实验复现漏显，
 界面与 CLI 会明确标注其结论不在零误剔声明范围内。
 
+### 证据版本与历史遮挡结论适用范围（`src/hiz.js` + `src/occlusion-cache.js`）
+
+每次由当前镜头重建 Hi-Z 都会取得单调递增的 `evidenceVersion`；冻结/迟到的旧金字塔
+保留戳记版本号，不占新版本。跨帧的 `occlusionCache` 只缓存真正的 `occluded`
+（near/edge/outside 等回退绝不缓存），每条结论带四项**适用范围**，全部满足才允许复用：
+
+1. **证据版本一致**：深度层一旦重建，旧结论立即 `version-stale` 失效；
+2. **屏幕范围覆盖**：旧查询矩形仍完整包住当前投影矩形，否则 `scope-grew`；
+3. **深度不更近**：当前包围体最近深度不比旧结论更近（容差 `depthMargin`），否则 `depth-nearer`；
+4. **无严重镜头位移**：运动界限判 `rebuild-requery`（含近裁穿越）时强制失效。
+
+任一不满足，旧 `occluded` 降级为 `stale-blocked` 并强制提交，交当前深度层重查——
+这就是“相机跳变 × 迟到查询交错回放”下首个可见帧不被旧值吞掉的结构性保证。
+`replayWithLateQuery(stampCam, currentCam)` 先在戳记镜头写入带范围的历史结论，
+再用同一版冻结证据跑迟到帧、最后重建当前帧，专门复现这条传播链；界面运动面板与
+候选表实时显示版本号、缓存命中/失效计数与每条裁决原因。
+
 ---
 
 ## 5. 零误剔声明及其精确范围
@@ -149,7 +172,7 @@ d(z) = far/(far-near) · (1 - near/z) ∈ [0,1]，越小越近
 
 **证据模式为 `current`（每帧用当前镜头的可靠遮挡物深度重建 Hi-Z）时**，在以下已执行验证内：
 
-- `npm test`：11/11 通过，其中包括
+- `npm test`：20/20 通过，其中包括
   - 3 场景默认机位的像素/集合完全一致且确有遮挡发生；
   - **确定性扫描**：每场景每分辨率 148 机位
     （12 yaw × 4 pitch × 3 距离 + 2 近裁逼近 + 2 屏幕边缘专项），
@@ -157,6 +180,14 @@ d(z) = far/(far-near) · (1 - near/z) ∈ [0,1]，越小越近
   - **种子 fuzz**（mulberry32 seed `20261125`）：3 场景 × 48 个随机机位
     （全周 yaw、pitch −1.2…1.2、距离 2.2…24、随机 FOV/near/目标偏移）@480×270，
     共 144 帧全部像素一致、零误剔；
+  - **保守查询边界回归**：可见小物体连续穿越近裁面（骑面帧必须 `near-fallback`、
+    完全到近面后 `outside-frustum`，全程零漏绘）；投影矩形越过屏幕四边必须
+    `edge-fallback` 且仍实际绘制；小物体从墙后连续移到墙外时 `occluded↔submitted`
+    状态正确迁移，首个可见帧不被旧值吞掉；回退对象不计入遮挡剔除成绩；
+  - **证据版本/适用范围**：Hi-Z 重建版本号单调递增，旧版本结论 `version-stale`、
+    范围扩大 `scope-grew`、包围体变近 `depth-nearer` 全部失效，回退结论不进缓存；
+  - **相机跳变 × 迟到查询回放**：迟到帧沿用戳记版本并因屏幕范围扩大失效、当前帧
+    重建版本号恢复剔除，迟到/当前两条路径都零漏绘；
   - mask 来源纯净、长梁/宝石专项、运动界限 Infinity、安全陈旧策略等测试。
 - `npm run verify`（完整 CLI）：3 场景 × **292** 机位
   （24 yaw × 4 pitch × 3 距离 + 4 专项）@480×270，共 876 个对比帧，
@@ -184,14 +215,18 @@ cli.js                   辅助 CLI：verify / audit / stale / bench / list
 src/math3d.js            相机、右手基、投影、深度约定、运动界限
 src/geometry.js          盒/球/凸包几何与各类保守包围体
 src/raster.js            软件光栅器（depth/uid/mask/RGBA）
-src/hiz.js               Hi-Z max/OR 归约与保守矩形查询、循环审计
-src/pipeline.js          候选分类、陈旧策略、绘制列表
+src/hiz.js               Hi-Z max/OR 归约、证据版本戳、保守矩形查询、循环审计
+src/occlusion-cache.js   历史 occluded 适用范围缓存（版本/屏幕范围/深度/运动失效）
+src/pipeline.js          候选分类、陈旧策略、缓存失效与相机跳放回放、绘制列表
 src/scene.js             三个场景与遮挡物 bit 分配
 src/verify.js            无剔除参照、像素/集合对比、相机扫描
 web/index.html           调试视窗结构
 web/styles.css           深色调试主题
-web/app.js               视窗接线、实时对比、Hi-Z 绘制、扫描
-test/culler.test.js      node:test 测试套件
+web/app.js               视窗接线、实时对比、Hi-Z 绘制、缓存/版本状态、扫描
+test/culler.test.js      node:test 测试套件（含近面/边缘边界回归与回放）
+tools/boundary-probe.mjs 近面/边缘/相机跳变最小复现探针
+tools/boundary-sweep.mjs 216 帧激进边界穷举（漏绘数 + 查询结论对照）
+tools/stale-requery-probe.mjs 非严重 requery 区间旧结论漏绘排查
 tools/dom-smoke.mjs      jsdom UI 接线冒烟（npm run smoke）
 tools/pwshot.mjs         可选 Playwright 真实浏览器截图脚本
 tools/png.mjs            零依赖 PNG 输出（调试快照用）

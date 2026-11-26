@@ -7,6 +7,7 @@ import { createRenderTarget, clearTarget, renderScene, countUidPixels } from '..
 import { runPipeline } from '../src/pipeline.js';
 import { verifyScene, verifyAllScenes } from '../src/verify.js';
 import { buildHiZ } from '../src/hiz.js';
+import { createOcclusionCache } from '../src/occlusion-cache.js';
 import { boundWireSegments } from '../src/geometry.js';
 
 const W = 480;
@@ -28,6 +29,9 @@ let moveLimit = 4;
 let selectedUid = null;
 let hizMode = 'linear';
 let hizLevelChoice = 'auto';
+
+// 跨帧持久的历史遮挡结论缓存：每条 occluded 带证据版本/屏幕范围/深度适用范围。
+const occlusionCache = createOcclusionCache();
 
 const viewCanvas = document.getElementById('view');
 const overlayCanvas = document.getElementById('overlay');
@@ -391,6 +395,8 @@ function refreshPanels(pipe, cam, frameMs, diffPixelsN) {
     stat(cullingOn ? '遮挡跳过三角形' : '剔除关闭·实际跳过', actualSkippedTris, actualSkippedTris ? 'good' : ''),
     stat('实时像素差异', diffPixelsN, diffPixelsN === 0 ? 'good' : 'red'),
     stat('参照可见 uid', lastRefCounts.size, 'blue'),
+    stat('深度层版本', pipe.hiZ.evidenceVersion == null ? '–' : `v${pipe.hiZ.evidenceVersion}`, 'blue'),
+    stat('缓存命中 / 失效', `${s.cacheHit ?? 0} / ${s.cacheInvalidated ?? 0}`, (s.cacheInvalidated ?? 0) ? 'amber' : 'good'),
   ].join('');
 
   document.getElementById('hud').textContent =
@@ -399,10 +405,15 @@ function refreshPanels(pipe, cam, frameMs, diffPixelsN) {
 
   const m = pipe.motion;
   const cls = m.decision === 'hold' ? 'dec-hold' : m.decision === 'requery' ? 'dec-requery' : 'dec-rebuild';
+  const st = pipe.stats;
+  const versionTxt = pipe.hiZ.evidenceVersion == null ? '–' : `v${pipe.hiZ.evidenceVersion}`;
   document.getElementById('motion-detail').innerHTML =
     `证据戳记镜头位移界限：<b class="${cls}">${m.boundPx === Infinity ? '∞' : m.boundPx.toFixed(1) + ' px'} / 限 ${m.limitTexels}px → ${
       m.decision === 'hold' ? '保持(hold)' : m.decision === 'requery' ? '界限内：废弃旧结论并重查(requery)' : '越界：重建深度+全量重查(rebuild)'
-    }</b><br><span>${m.detail}</span>`;
+    }</b><br><span>${m.detail}</span>` +
+    `<br><span class="evidence-line">深度层版本 <b>${versionTxt}</b>${pipe.frozen ? '（冻结旧层）' : '（当前帧重建）'}` +
+    ` · 历史遮挡结论缓存 ${occlusionCache.size()} 条 · 本帧命中 ${st.cacheHit ?? 0} · 适用范围失效 ${st.cacheInvalidated ?? 0}` +
+    `（version-stale / scope-grew / depth-nearer 任一命中即强制提交重查）</span>`;
 
   // 候选表
   for (const [uid, refs] of rowRefs) {
@@ -432,6 +443,18 @@ function refreshPanels(pipe, cam, frameMs, diffPixelsN) {
       refs.slack.textContent = '–';
       refs.tex.textContent = d.frustumPlane ? `plane:${d.frustumPlane}` : '未查询';
       refs.owners.innerHTML = '';
+    }
+    // 历史遮挡结论适用范围裁决（深度层版本/屏幕范围/深度/运动界限）。
+    if (d.cache) {
+      const map = {
+        'cache-hit': ['命中沿用', 'slack-ok'],
+        'version-stale': ['深度层版本失效', 'slack-bad'],
+        'scope-grew': ['屏幕范围超出旧证据', 'slack-bad'],
+        'depth-nearer': ['当前包围体更近', 'slack-bad'],
+        'not-cached': ['无历史结论', 'dim'],
+      };
+      const [txt, cls2] = map[d.cache.why] ?? [d.cache.why, 'dim'];
+      refs.tex.innerHTML += `<div class="cache-verdict ${cls2}">缓存:${txt}${d.evidenceVersion != null ? ` · v${d.evidenceVersion}` : ''}</div>`;
     }
   }
 
@@ -468,6 +491,14 @@ function refreshPanels(pipe, cam, frameMs, diffPixelsN) {
   } else if (circularCaught > 0) {
     bar.className = 'anomaly warn';
     bar.textContent = `循环依据审计：${circularCaught} 个候选的查询证据包含其自身写入的 bit，已拒绝据此剔除。正式流水线只允许可靠遮挡物写入 Hi-Z。`;
+  } else if ((pipe.stats.cacheInvalidated ?? 0) > 0) {
+    const why = [...pipe.decisions.values()]
+      .filter((d) => d.cache && !d.cache.reusable && d.cache.why !== 'not-cached')
+      .map((d) => d.cache.why);
+    const hist = why.reduce((a, k) => ((a[k] = (a[k] ?? 0) + 1), a), {});
+    bar.className = 'anomaly warn';
+    bar.textContent = `历史遮挡结论适用范围失效 ${pipe.stats.cacheInvalidated} 条（${JSON.stringify(hist)}）：` +
+      '深度层版本/屏幕范围/深度已不匹配，旧值被拦截并强制提交重查，首个可见帧不会被旧结论吞掉。';
   } else if (pipe.frozen && pipe.motion.severe) {
     const boundTxt = Number.isFinite(pipe.motion.boundPx) ? pipe.motion.boundPx.toFixed(1) + 'px' : '∞';
     bar.className = 'anomaly warn';
@@ -510,6 +541,7 @@ function frame(now) {
     frozenEvidence: evidence ?? undefined,
     stalePolicy: safeStale ? 'safe' : 'apply-for-experiment',
     moveLimitTexels: moveLimit,
+    occlusionCache,
   });
 
   // pending 冻结：捕获本帧刚生成的当前证据

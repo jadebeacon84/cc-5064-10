@@ -9,6 +9,7 @@ import { basis, frustumPlanes, viewCoords, depthFromZ, motionBound, sameCamera }
 import { boundVertices } from './geometry.js';
 import { createRenderTarget, clearTarget, renderScene } from './raster.js';
 import { buildHiZ, queryRect, auditSelfEvidence } from './hiz.js';
+import { createOcclusionCache, CACHE_DECISION } from './occlusion-cache.js';
 
 export const STATUS = {
   OUTSIDE_FRUSTUM: 'outside-frustum',
@@ -56,6 +57,8 @@ export function classifyCandidate(obj, cam, hiZ, options = {}) {
     zMin: null,
     dNear: null,
     frustumPlane: null,
+    evidenceVersion: hiZ.evidenceVersion ?? null,
+    cache: null,
   };
 
   const outPlane = outsideFrustum(vertices, cam);
@@ -166,6 +169,8 @@ function collectOccluderPoints(scene) {
 }
 
 // 主入口。frozenEvidence 可注入旧 Hi-Z 做陈旧证据实验。
+// occlusionCache 可跨帧注入：历史 occluded 仅在适用范围（证据版本/屏幕范围/深度/运动界限）
+// 全部满足时才允许复用，否则按当前深度层重查，避免旧值吞掉首个可见帧。
 export function runPipeline(scene, cam, width, height, options = {}) {
   const occluders = scene.objects.filter((o) => o.reliableOccluder);
   const candidates = scene.objects.filter((o) => o.candidate === true);
@@ -183,7 +188,7 @@ export function runPipeline(scene, cam, width, height, options = {}) {
     occluderRT = createRenderTarget(width, height);
     clearTarget(occluderRT);
     renderScene(occluderRT, cam, occluders, { writeMask: true });
-    hiZ = buildHiZ(occluderRT.depth, occluderRT.mask, width, height);
+    hiZ = buildHiZ(occluderRT.depth, occluderRT.mask, width, height, options.hiZOptions);
   }
 
   const ownerNames = new Map();
@@ -196,6 +201,7 @@ export function runPipeline(scene, cam, width, height, options = {}) {
     options.moveLimitTexels ?? 4, width, height,
   );
 
+  const cache = options.occlusionCache ?? createOcclusionCache();
   const decisions = new Map();
   const culled = [];
   const culledSet = new Set();
@@ -210,6 +216,8 @@ export function runPipeline(scene, cam, width, height, options = {}) {
     edgeFallback: 0,
     submitted: 0,
     staleBlocked: 0,
+    cacheHit: 0,
+    cacheInvalidated: 0,
     totalTris: 0,
     submittedTris: 0,
     skippedOcclusionTris: 0,
@@ -221,6 +229,31 @@ export function runPipeline(scene, cam, width, height, options = {}) {
 
   for (const obj of candidates) {
     const d = classifyCandidate(obj, cam, hiZ, options);
+
+    // 历史遮挡结论适用范围校验（迟到查询/相机跳变回放路径）。
+    // 仅对“本帧据证据判 occluded”的候选检查缓存：旧结论版本/范围/深度不匹配即失效，
+    // 强制按当前深度层重查；near/edge/outside 等回退本就不进缓存。
+    if (d.status === STATUS.OCCLUDED) {
+      const verdict = cache.applicability(obj.uid, {
+        evidenceVersion: hiZ.evidenceVersion ?? null,
+        rect: d.rect,
+        dNear: d.dNear,
+        motionSevere: motion.severe,
+      });
+      d.cache = { reusable: verdict.reusable, why: verdict.why };
+      if (!verdict.reusable && verdict.why !== CACHE_DECISION.NOT_CACHED) {
+        stats.cacheInvalidated++;
+        // 旧结论不再适用：安全侧回退为提交绘制，交由当前/下一帧证据重新证明。
+        d.originalStatus = d.status;
+        d.invalidatedWhy = verdict.why;
+        d.status = STATUS.STALE_BLOCKED;
+        d.cull = false;
+        d.reason = `历史遮挡结论超出适用范围（${verdict.why}），旧值失效，强制提交并等待当前深度层重查`;
+      } else if (verdict.reusable) {
+        stats.cacheHit++;
+      }
+    }
+
     // 陈旧证据安全策略：越界后不允许依据旧金字塔真正剔除。
     if (frozen && motion.severe && d.status === STATUS.OCCLUDED && options.stalePolicy !== 'apply-for-experiment') {
       d.originalStatus = d.status;
@@ -244,10 +277,24 @@ export function runPipeline(scene, cam, width, height, options = {}) {
       culledSet.add(obj.uid);
       stats.occluded++;
       stats.skippedOcclusionTris += d.triCount;
+      // 仅把当前证据版本下成立的 occluded 连同适用范围写入缓存。
+      if (!frozen) {
+        cache.remember(obj.uid, {
+          status: STATUS.OCCLUDED,
+          evidenceVersion: hiZ.evidenceVersion ?? null,
+          stampCamera: cam,
+          rect: d.rect,
+          dNear: d.dNear,
+          level: d.query?.level ?? null,
+          margin: d.query?.margin ?? null,
+        });
+      }
     } else {
       stats.submitted++;
       stats.submittedTris += d.triCount;
       if (d.status === STATUS.STALE_BLOCKED) stats.staleBlocked++;
+      // 一旦当前证据不再支持剔除，历史结论立即作废，防止后续帧复用脏值。
+      if (!frozen) cache.map.delete(obj.uid);
     }
   }
 
@@ -259,6 +306,21 @@ export function runPipeline(scene, cam, width, height, options = {}) {
 
   return {
     width, height, hiZ, occluderRT, evidenceCam, frozen, motion,
-    decisions, drawList, culled, culledSet, stats, ownerNames,
+    decisions, drawList, culled, culledSet, stats, ownerNames, occlusionCache: cache,
   };
+}
+
+// 相机跳变 × 迟到查询交错回放：
+// 先用戳记镜头建立带适用范围的历史 occluded（写入共享缓存），再用“戳记帧的同一版
+// 深度证据 + 当前镜头”跑一帧迟到查询，最后用当前镜头重建的新深度层跑一帧。
+// 历史结论带证据版本/屏幕范围/深度/运动界限；首个可见帧不会被旧值吞掉。
+export function replayWithLateQuery(scene, stampCam, currentCam, width, height, cache, options = {}) {
+  const stampPipe = runPipeline(scene, stampCam, width, height, { ...options, occlusionCache: cache });
+  const late = runPipeline(scene, currentCam, width, height, {
+    ...options,
+    occlusionCache: cache,
+    frozenEvidence: { hiZ: stampPipe.hiZ, camera: stampCam },
+  });
+  const fresh = runPipeline(scene, currentCam, width, height, { ...options, occlusionCache: cache });
+  return { stampPipe, late, fresh };
 }

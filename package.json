@@ -11,9 +11,13 @@
     "stale": "node cli.js stale",
     "bench": "node cli.js bench",
     "smoke": "node tools/dom-smoke.mjs",
+    "probe:boundary": "node tools/boundary-probe.mjs",
+    "probe:sweep": "node tools/boundary-sweep.mjs",
+    "probe:stale": "node tools/stale-requery-probe.mjs",
     "test": "node --test test/culler.test.js"
   },
   "devDependencies": {
-    "jsdom": "^31.0.1"
+    "jsdom": "^31.0.1",
+    "playwright": "^1.65.1"
   }
 }

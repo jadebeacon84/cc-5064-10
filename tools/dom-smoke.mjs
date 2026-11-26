@@ -75,6 +75,22 @@ assert($('visible-chips').children.length > 0, '实际可见集 chips 非空');
 assert($('hiz-levels').children.length >= 8, `深度层缩略图已生成 (${$('hiz-levels').children.length})`);
 assert(!$('anomaly-bar').classList.contains('error'), `默认机位无红色异常：${$('anomaly-bar').textContent.slice(0, 80)}`);
 assert($('anomaly-bar').classList.contains('ok'), '默认机位显示实时核对通过');
+assert($('motion-detail').textContent.includes('深度层版本'), '运动面板显示深度层版本与缓存适用范围');
+
+// 转动相机制造镜头跳变：历史 occluded 的适用范围（屏幕范围/版本）应失效并被拦截，
+// 随后在当前深度层重建后恢复，全程不得出现红色漏显。
+const wrap0 = $('viewport-wrap');
+wrap0.dispatchEvent(new window.PointerEvent('pointerdown', { button: 0, clientX: 100, clientY: 100, bubbles: true }));
+for (let i = 0; i < 10; i++) {
+  wrap0.dispatchEvent(new window.PointerEvent('pointermove', { clientX: 100 + (i + 1) * 26, clientY: 100, bubbles: true }));
+}
+wrap0.dispatchEvent(new window.PointerEvent('pointerup', { bubbles: true }));
+step(40);
+assert(!$('anomaly-bar').classList.contains('error'), '相机跳变后无红色漏显异常');
+const statsText = $('stats-grid').textContent;
+assert(statsText.includes('缓存命中'), '统计卡含缓存命中/失效指标');
+step(30);
+assert(!$('anomaly-bar').classList.contains('error'), '重建深度层后仍无漏显');
 
 // 选择一个候选行
 $('candidate-rows').children[3].click();

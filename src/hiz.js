@@ -6,7 +6,7 @@
 //   深度值越小越近；若物体包围体的最近深度 dNear 仍严格远于
 //   区块 max 深度（dNear >= cellMax + margin），则整个区块被遮挡。
 
-export function buildHiZ(depth0, mask0, width, height) {
+export function buildHiZ(depth0, mask0, width, height, options = {}) {
   const levels = [{ width, height, depth: depth0, mask: mask0, level: 0 }];
   let pw = width;
   let ph = height;
@@ -45,7 +45,21 @@ export function buildHiZ(depth0, mask0, width, height) {
     pd = nd;
     pm = nm;
   }
-  return { width, height, levels };
+  // 证据版本戳：每个由当前镜头重建的金字塔单调递增；迟到/冻结的旧金字塔保留旧版本号，
+  // 遮挡结果缓存据此判定结论是否仍适用于当前深度层。
+  const evidenceVersion = options.evidenceVersion ?? nextEvidenceVersion();
+  return { width, height, levels, evidenceVersion };
+}
+
+// 模块级单调版本源；runPipeline 也可显式注入版本号以便回放对齐。
+let VERSION_COUNTER = 0;
+export function nextEvidenceVersion() {
+  VERSION_COUNTER += 1;
+  return VERSION_COUNTER;
+}
+
+export function currentEvidenceVersion() {
+  return VERSION_COUNTER;
 }
 
 // 屏幕矩形（level0 闭区间整数坐标）上的保守 Hi-Z 查询。
